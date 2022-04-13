@@ -10,13 +10,14 @@ def sweep_summary(sweep_id, n_top):
     project = sweep.project
     name = sweep.config['name']
 
+
     best_runs = pd.DataFrame()
     for run in sweep.runs:
         history = run.history()
-        if 'valid_acc' not in history.columns:
+        if 'valid_ap' not in history.columns:
             continue
 
-        best = history.valid_acc.idxmax()
+        best = history.valid_ap.idxmax()
         entry = history.loc[best].copy()
         entry['state'] = run.state
         entry['id'] = run.id
@@ -24,8 +25,9 @@ def sweep_summary(sweep_id, n_top):
         entry['beta'] = run.config['beta']
         best_runs = best_runs.append(entry)
 
-    metrics = ['biased_test_acc', 'unbiased_test_acc']
-    best_runs = best_runs.sort_values('valid_acc', ascending=False).loc[:, ['valid_acc'] + metrics + ['alpha', 'beta', 'state', 'id']]
+
+    metrics = ['best.test_ap','best.test_ba','best.test_deo','best.test_kl']
+    best_runs = best_runs.sort_values('valid_ap', ascending=False).loc[:, ['valid_ap'] + metrics + ['alpha', 'beta', 'state', 'id']]
     
     print(f'------- SUMMARY FOR {project}/{name} -------')
     print(best_runs)

@@ -1,0 +1,31 @@
+program: EnD_rebias_mnist_sweep.py
+name: "Celeba - EnD"
+command:
+    - ${env}
+    - python3
+    - ${program}
+    - ${args}
+method: bayes
+metric:
+    name: valid_acc
+    goal: maximize
+parameters:
+    alpha:
+        distribution: uniform
+        min: 0.0
+        max: 50.0
+    beta:
+        distribution: uniform
+        min: 0.0
+        max: 50.0
+    lr:
+        value: 0.001
+    weight_decay:
+        value: 1e-4
+    batch_size:
+        value: 64
+    epochs:
+        value: 50
+    attribute:
+        value: 27
+

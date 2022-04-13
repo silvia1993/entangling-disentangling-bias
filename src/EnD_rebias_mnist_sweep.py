@@ -17,6 +17,9 @@ from EnD import *
 from configs import *
 from collections import defaultdict
 import colour_mnist
+import celeba
+import utils
+
 import models
 from tqdm import tqdm
 
@@ -35,8 +38,8 @@ def train(model, dataloader, criterion, weights, optimizer, scheduler):
     tot_abs = 0.
     model.train()
 
-    for data, labels, color_labels in tqdm(dataloader, leave=False):
-        data, labels, color_labels = data.to(device), labels.to(device), color_labels.to(device)
+    for data, labels, color_labels,_ in tqdm(dataloader, leave=False):
+        data, labels, color_labels = data.to(device=device), labels.to(device=device,dtype=torch.long), color_labels.to(device=device,dtype=torch.long)
 
         optimizer.zero_grad()
         with torch.enable_grad():
@@ -65,13 +68,23 @@ def test(model, dataloader, criterion, weights):
     tot_correct = 0
     tot_loss = 0
 
+    y_all = []
+    scores_all = []
+
     model.eval()
 
-    for data, labels, color_labels in tqdm(dataloader, leave=False):
-        data, labels, color_labels = data.to(device), labels.to(device), color_labels.to(device)
+    for data, labels, color_labels,both_labels in tqdm(dataloader, leave=False):
+        data, labels, color_labels, both_labels = data.to(device), labels.to(device=device,dtype=torch.long), color_labels.to(device=device,dtype=torch.long), both_labels.to(device=device,dtype=torch.long)
 
         with torch.no_grad():
             outputs = model(data)
+
+        scores,_ = outputs.max(dim=1)
+        scores = torch.sigmoid(scores).squeeze()
+        scores_all.append(scores.detach().cpu().numpy())
+
+        y_all.append(both_labels.detach().cpu().numpy())
+
         loss = criterion(outputs, labels, color_labels, weights)
 
         batch_size = data.shape[0]
@@ -79,9 +92,11 @@ def test(model, dataloader, criterion, weights):
         num_samples += batch_size
         tot_loss += loss.item() * batch_size
 
+    y_all = np.concatenate(y_all)
+    pred_all = np.concatenate(scores_all)
     avg_accuracy = tot_correct / num_samples
     avg_loss = tot_loss / num_samples
-    return avg_accuracy, avg_loss
+    return avg_accuracy, avg_loss, y_all, pred_all
 
 
 def main(config):
@@ -95,31 +110,57 @@ def main(config):
     torch.backends.cudnn.benchmark = False
     torch.manual_seed(seed)
 
-    train_loader, valid_loader = colour_mnist.get_biased_mnist_dataloader(
-        f'{os.path.expanduser("~")}/data',
-        config.batch_size,
-        config.rho,
-        train=True
-    )
+    if config.dataset == 'mnist':
+        train_loader, valid_loader = colour_mnist.get_biased_mnist_dataloader(
+            f'{os.path.expanduser("~")}/data',
+            config.batch_size,
+            config.rho,
+            train=True
+        )
 
-    biased_test_loader = colour_mnist.get_biased_mnist_dataloader(
-        f'{os.path.expanduser("~")}/data',
-        config.batch_size,
-        1.0,
-        train=False
-    )
+        biased_test_loader = colour_mnist.get_biased_mnist_dataloader(
+            f'{os.path.expanduser("~")}/data',
+            config.batch_size,
+            1.0,
+            train=False
+        )
 
-    unbiased_test_loader = colour_mnist.get_biased_mnist_dataloader(
-        f'{os.path.expanduser("~")}/data',
-        config.batch_size,
-        0.1,
-        train=False
-    )
+        unbiased_test_loader = colour_mnist.get_biased_mnist_dataloader(
+            f'{os.path.expanduser("~")}/data',
+            config.batch_size,
+            0.1,
+            train=False
+        )
+
+    elif config.dataset == 'celeba':
+        train_loader = celeba.create_dataset(config.batch_size,
+            config.dataset_path,
+            config.attribute,
+            config.protected_attribute,
+            True, split='train')
+
+        valid_loader = celeba.create_dataset(config.batch_size,
+            config.dataset_path,
+            config.attribute,
+            config.protected_attribute,
+            False, split='valid')
+
+        test_loader = celeba.create_dataset(config.batch_size,
+            config.dataset_path,
+            config.attribute,
+            config.protected_attribute,
+            False, split='test')
 
     print('Training debiased model')
     print('Config:', config)
 
-    model = models.simple_convnet()
+    if config.model == 'simple_convnet':
+        model = models.simple_convnet()
+    elif config.model == 'resnet18':
+        model = models.resnet18()
+    elif config.model == 'resnet50':
+        model = models.resnet50()
+
     model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -140,20 +181,53 @@ def main(config):
         train_acc, train_loss, train_bce, train_abs = train(model, train_loader, ce_abs, None, optimizer, scheduler=None)
         scheduler.step()
 
-        valid_acc, valid_loss = test(model, valid_loader, ce, None)
-        biased_test_acc, biased_test_loss = test(model, biased_test_loader, ce, None)
-        unbiased_test_acc, unbiased_test_loss = test(model, unbiased_test_loader, ce, None)
+
+        valid_acc, valid_loss,val_targets, val_scores = test(model, valid_loader, ce, None)
+        test_acc, test_loss,test_targets, test_scores = test(model, test_loader, ce, None)
 
         print(f'Epoch {i} - Train acc: {train_acc:.4f}, train_loss: {train_loss:.4f} (bce: {train_bce:.4f} abs: {train_abs:.4f});')
-        print(f'Valid acc {valid_acc:.4f}, loss: {valid_loss:.4f}')
-        print(f'Biased test acc: {biased_test_acc:.4f}, loss: {biased_test_loss:.4f}')
-        print(f'Unbiased test acc: {unbiased_test_acc:.4f}, loss: {unbiased_test_loss:.4f}')
 
-        if valid_acc > best['valid_acc']:
+        cal_thresh = utils.calibrated_threshold(val_targets[:, 0], val_scores)
+        f1_score, f1_thresh = utils.get_threshold(val_targets[:, 0], val_scores)
+        val_pred = np.where(val_scores > cal_thresh, 1, 0)
+        test_pred = np.where(test_scores > cal_thresh, 1, 0)
+
+        ap_val, ap_std_val = utils.bootstrap_ap(val_targets[:, 0], val_scores)
+        deo_val, deo_std_val = utils.bootstrap_deo(val_targets[:, 1], val_targets[:, 0], val_pred)
+        ba_val, ba_std_val = utils.bootstrap_bias_amp(val_targets[:, 1], val_targets[:, 0], val_pred)
+        kl_val, kl_std_val = utils.bootstrap_kl(val_targets[:, 1], val_targets[:, 0], val_scores)
+
+
+        print('Validation results: ')
+        print('AP : {:.1f} +- {:.1f}', 100 * ap_val, 200 * ap_std_val)
+        print('DEO : {:.1f} +- {:.1f}', 100 * deo_val, 200 * deo_std_val)
+        print('BA : {:.1f} +- {:.1f}', 100 * ba_val, 200 * ba_std_val)
+        print('KL : {:.1f} +- {:.1f}', kl_val, 2 * kl_val)
+
+
+        ap, ap_std = utils.bootstrap_ap(test_targets[:, 0], test_scores)
+        deo, deo_std = utils.bootstrap_deo(test_targets[:, 1], test_targets[:, 0], test_pred)
+        ba, ba_std = utils.bootstrap_bias_amp(test_targets[:, 1], test_targets[:, 0], test_pred)
+        kl, kl_std = utils.bootstrap_kl(test_targets[:, 1], test_targets[:, 0], test_scores)
+
+
+        print('Test results: ')
+        print('AP : {:.1f} +- {:.1f}', 100 * ap, 200 * ap_std)
+        print('DEO : {:.1f} +- {:.1f}', 100 * deo, 200 * deo_std)
+        print('BA : {:.1f} +- {:.1f}', 100 * ba, 200 * ba_std)
+        print('KL : {:.1f} +- {:.1f}', kl, 2 * kl)
+
+
+        if ap_val > best['valid_ap']:
             best = dict(
-                valid_acc = valid_acc,
-                biased_test_acc = biased_test_acc,
-                unbiased_test_acc = unbiased_test_acc
+                valid_ap = ap_val,
+                valid_deo = deo_val,
+                valid_ba = ba_val,
+                valid_kl = kl_val,
+                test_ap = ap,
+                test_deo = deo,
+                test_ba = ba,
+                test_kl = kl
             )
 
         if not config.local:
@@ -163,13 +237,11 @@ def main(config):
                 'train_bce': train_bce,
                 'train_abs': train_abs,
 
-                'valid_acc': valid_acc,
+                'valid_ap': ap_val,
                 'valid_loss': valid_loss,
 
-                'biased_test_acc': biased_test_acc,
-                'biased_test_loss': biased_test_loss,
-                'unbiased_test_acc': unbiased_test_acc,
-                'unbiased_test_loss': unbiased_test_loss,
+                'test_ap': ap,
+                'test_loss': test_loss,
 
                 'best': best
             }
@@ -189,16 +261,24 @@ if __name__ == '__main__':
         )
         hyperparameters_defaults.update(vars(config))
 
-        tags = ['abs']
+        labels_attr = ['5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes', 'Bald', 'Bangs', 'Big_Lips',
+                'Big_Nose', 'Black_Hair', 'Blond_Hair', 'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby',
+                'Double_Chin', 'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones', 'Male',
+                'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose',
+                'Receding_Hairline', 'Rosy_Cheeks', 'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair',
+                'Wearing_Earrings', 'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young']
+
+        tags = [labels_attr[config.attribute]]
         if config.alpha == 0 and config.beta == 0:
             tags = ['baseline']
         tags.append(str(config.rho))
+
 
         wandb.init(
             config=hyperparameters_defaults,
             project='EnD-cvpr21',
             anonymous='allow',
-            name=f'biased-mnist-rho{str(config.rho)}-{tags[0]}-valid',
+            name=f'Celeba-{tags[0]}-valid',
             tags=tags,
             group=tags[0]
         )
